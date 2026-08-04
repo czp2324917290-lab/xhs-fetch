@@ -1,0 +1,16 @@
+# Render 部署配置（Blueprint）
+# 在 Render 控制台「Blueprints」→ New Blueprint → 连接 GitHub 仓库 → 选此文件即可。
+services:
+  - type: web
+    name: xhs-fetch-proxy
+    runtime: python
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      - key: PORT
+        value: "10000"
