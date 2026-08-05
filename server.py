@@ -67,25 +67,63 @@ def _meta(html, prop=None, name=None):
 
 
 def _extract_xhs_json(html):
-    """从页面内嵌 JSON 粗提取标题/描述（多种转义格式）。"""
+    """从页面内嵌 JSON 提取标题/描述候选，优先 noteCard 作用域，再按可信度挑选。"""
+    def _titles():
+        out = []
+        for pat in (r'\\"title\\"\s*:\s*\\"((?:[^"\\]|\\.)*?)\\"',
+                    r'"title"\s*:\s*"((?:[^"\\]|\\.)*)"'):
+            for mm in re.finditer(pat, html):
+                c = _clean(mm.group(1))
+                if c:
+                    out.append(c)
+        return out
+
+    def _descs():
+        out = []
+        for pat in (r'\\"desc\\"\s*:\s*\\"((?:[^"\\]|\\.)*?)\\"',
+                    r'"desc"\s*:\s*"((?:[^"\\]|\\.)*)"'):
+            for mm in re.finditer(pat, html):
+                c = _clean(mm.group(1))
+                if c:
+                    out.append(c)
+        return out
+
+    # 1) noteCard 作用域优先（最可能是笔记本体），escaped 与 unescaped 都试
     t = d = ""
-    # 格式1: \"title\":\"...\"
-    m = re.search(r'\\"title\\"\s*:\s*\\"(.*?)\\"', html)
+    m = re.search(r'noteCard"\s*:\s*\{', html)
     if m:
-        t = _clean(m.group(1))
-    m = re.search(r'\\"desc\\"\s*:\s*\\"(.*?)\\"', html)
-    if m:
-        d = _clean(m.group(1))
-    # 格式2: "title":"..." （未转义）
+        seg = html[m.end(): m.end() + 8000]
+        mt = re.search(r'"title"\s*:\s*"((?:[^"\\]|\\.)*)"', seg) \
+            or re.search(r'\\"title\\"\s*:\s*\\"((?:[^"\\]|\\.)*?)\\"', seg)
+        if mt:
+            t = _clean(mt.group(1))
+        md = re.search(r'"desc"\s*:\s*"((?:[^"\\]|\\.)*)"', seg) \
+            or re.search(r'\\"desc\\"\s*:\s*\\"((?:[^"\\]|\\.)*?)\\"', seg)
+        if md:
+            d = _clean(md.group(1))
+
+    # 2) 兜底：整页所有 title 候选里挑最像笔记标题的（排除站点通用标题）
     if not t:
-        m = re.search(r'"title"\s*:\s*"(.*?)"', html)
-        if m:
-            t = _clean(m.group(1))
+        t = _pick_title(_titles())
+    # 3) 兜底：desc 取最长候选
     if not d:
-        m = re.search(r'"desc"\s*:\s*"(.*?)"', html)
-        if m:
-            d = _clean(m.group(1))
+        ds = _descs()
+        d = max(ds, key=len) if ds else ""
     return t, d
+
+
+def _pick_title(cands):
+    cands = [c for c in cands if c and c not in GENERIC_TITLES]
+    if not cands:
+        return ""
+    # 含中文、长度适中(5~40字)的，取最长（笔记标题通常比昵称/卡片标题更长更完整）
+    good = [c for c in cands if re.search(r'[\u4e00-\u9fff]', c) and 5 <= len(c) <= 40]
+    if good:
+        return max(good, key=len)
+    cjk = [c for c in cands if re.search(r'[\u4e00-\u9fff]', c)]
+    if cjk:
+        return max(cjk, key=len)
+    return cands[0]
 
 
 def _get_html(url, timeout=15):
@@ -139,8 +177,11 @@ def fetch_note(raw_url):
         m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
         if m:
             title = _clean(m.group(1))
+    # 去掉站点后缀（如 "真实标题 - 小红书"）
+    title = re.sub(r"\s*[-–|]\s*小红书.*$", "", title).strip()
     xt, xd = _extract_xhs_json(html)
-    title = xt or title
+    if xt and xt not in GENERIC_TITLES:
+        title = xt
 
     desc = _meta(html, prop="og:description")
     if not desc:
