@@ -280,7 +280,14 @@ def fetch_note(raw_url, debug=False):
 
     # ===== 第一优先级：window.__INITIAL_STATE__（小红书 SSR 注入的笔记完整数据） =====
     note_id = _extract_note_id(final_url)
-    title, desc, tags, images = _extract_initial_state(html, prefer_id=note_id)
+    note_map = _get_note_map(html)
+    if note_id in note_map:
+        # 普通笔记：noteId 精确匹配，标题/正文最可靠
+        title, desc, tags, images = _extract_initial_state(html, prefer_id=note_id)
+    else:
+        # 商品/带货笔记：__INITIAL_STATE__ 无同步笔记数据，标题交给分享文本兜底，正文仍尝试兜底
+        _, desc, tags, images = _extract_initial_state(html, prefer_id=note_id)
+        title = ""
     if debug:
         debug_info["has_initial_state"] = bool(re.search(r'(?:window\.)?__INITIAL_STATE__\s*=', html))
         debug_info["initial_state_hit"] = bool(title or desc)
