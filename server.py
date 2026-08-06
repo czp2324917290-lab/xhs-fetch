@@ -217,12 +217,13 @@ def _get_html(url, timeout=15):
         return data.decode(charset, errors="ignore")
 
 
-def fetch_note(raw_url):
+def fetch_note(raw_url, debug=False):
     url = _extract_url(raw_url)
     if not url:
-        return {"ok": False, "reason": "未提供有效链接（请把手机复制的链接/分享文本粘贴进来）"}
+        return {"ok": False, "reason": "未提供有效链接（请把手机复制的链接/分享文本粘贴进来）}
 
     status = 200
+    debug_info = {}
     try:
         html = _get_html(url)
     except urllib.error.HTTPError as e:
@@ -239,6 +240,11 @@ def fetch_note(raw_url):
 
     # ===== 第一优先级：window.__INITIAL_STATE__（小红书 SSR 注入的笔记完整数据） =====
     title, desc, tags, images = _extract_initial_state(html)
+    if debug:
+        debug_info["has_initial_state"] = bool(re.search(r'(?:window\.)?__INITIAL_STATE__\s*=', html))
+        debug_info["initial_state_hit"] = bool(title or desc)
+        debug_info["og_title"] = _meta(html, prop="og:title")
+        debug_info["final_url"] = url
 
     # 去掉站点后缀（如 "真实标题 - 小红书"）
     title = re.sub(r"\s*[-–|]\s*小红书.*$", "", title).strip()
@@ -275,6 +281,7 @@ def fetch_note(raw_url):
             "ok": False,
             "reason": "小红书返回了拦截页（云端 IP 被识别）。"
                       "建议：①把笔记文字直接粘贴到输入框；②或把链接发到 WorkBuddy 对话由我代抓。",
+            "debug": debug_info,
         }
 
     note = ""
@@ -286,7 +293,10 @@ def fetch_note(raw_url):
     if images:
         note = (note + " 含" + str(len(images)) + "张图片") if note else ""
 
-    return {"ok": True, "title": title, "body": desc, "tags": tags, "note": note, "images": images[:9]}
+    result = {"ok": True, "title": title, "body": desc, "tags": tags, "note": note, "images": images[:9]}
+    if debug:
+        result["debug"] = debug_info
+    return result
 
 
 @app.route("/")
@@ -300,12 +310,15 @@ def api_fetch():
     if request.method == "OPTIONS":
         return _cors(jsonify({}))
     url = ""
+    debug = False
     if request.method == "GET":
         url = request.args.get("url", "")
+        debug = request.args.get("debug", "") in ("1", "true", "on")
     else:
         data = request.get_json(force=True, silent=True) or {}
         url = (data.get("url") or "").strip()
-    result = fetch_note(url)
+        debug = bool(data.get("debug"))
+    result = fetch_note(url, debug=debug)
     return _cors(jsonify(result))
 
 
