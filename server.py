@@ -194,11 +194,16 @@ def _extract_note_id(url):
 
 
 def _pick_note(note_map, prefer_id=None):
-    """从 noteDetailMap 选目标笔记：优先 prefer_id 精确匹配，否则选 desc 最长的。"""
+    """从 noteDetailMap 选目标笔记：优先 prefer_id 匹配（兼容 explore/ 前缀差异），否则选 desc 最长的。"""
     if not note_map:
         return {}
-    if prefer_id and prefer_id in note_map:
-        return note_map[prefer_id].get("note") or {}
+    if prefer_id:
+        if prefer_id in note_map:
+            return note_map[prefer_id].get("note") or {}
+        # 兼容 key 格式差异：noteDetailMap 的 key 常为 'explore/xxx'，而我们提取的是纯 id
+        for k, v in note_map.items():
+            if prefer_id in k or k.endswith(prefer_id):
+                return v.get("note") or {}
     best = None
     best_len = -1
     for v in note_map.values():
