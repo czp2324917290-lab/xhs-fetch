@@ -180,13 +180,16 @@ def fetch_note(raw_url):
     # 去掉站点后缀（如 "真实标题 - 小红书"）
     title = re.sub(r"\s*[-–|]\s*小红书.*$", "", title).strip()
     xt, xd = _extract_xhs_json(html)
-    if xt and xt not in GENERIC_TITLES:
+    # og:title 优先（最可靠：XHS 把笔记标题放进 og:title）；仅当 og:title 缺失或为站点通用标题时，才用页面内嵌 JSON 兜底
+    if (not title or title in GENERIC_TITLES) and xt and xt not in GENERIC_TITLES:
         title = xt
 
     desc = _meta(html, prop="og:description")
     if not desc:
         desc = _meta(html, name="description")
-    desc = xd or desc
+    # og:description 优先；仅当缺失时用 JSON 提取兜底
+    if not desc and xd:
+        desc = xd
 
     tags_found = re.findall(r"#([^\s#@]+)", title + " " + desc)
     tags = " ".join("#" + t for t in dict.fromkeys(tags_found)) if tags_found else ""
