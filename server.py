@@ -13,6 +13,7 @@
 """
 import os
 import re
+import json
 import random
 import gzip
 import urllib.request
@@ -126,6 +127,71 @@ def _pick_title(cands):
     return cands[0]
 
 
+def _extract_initial_state(html):
+    """从 window.__INITIAL_STATE__ 提取笔记真实数据（小红书 SSR 注入）。
+    这是最可靠的数据源——标题、正文、标签、图片都在里面，不需要登录态。
+    返回 (title, desc, tags_str, images_list)。"""
+    # 匹配 __INITIAL_STATE__ = {...}  或  window.__INITIAL_STATE__ = {...}
+    m = re.search(r'(?:window\.)?__INITIAL_STATE__\s*=\s*', html)
+    if not m:
+        return "", "", "", []
+
+    # 从 = 之后开始找 JSON 对象
+    pos = m.end()
+    # 简单的手工 JSON 提取：数大括号层级
+    if pos >= len(html) or html[pos] != "{":
+        return "", "", "", []
+    depth = 0
+    end = pos
+    in_str = False
+    esc = False
+    for i in range(pos, min(pos + 500000, len(html))):
+        ch = html[i]
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"' and not esc:
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+
+    if end <= pos:
+        return "", "", "", ""
+
+    raw = html[pos:end]
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return "", "", "", ""
+
+    # 导航到笔记数据：note.noteDetailMap.{noteId}.note
+    note_map = (data.get("note") or {}).get("noteDetailMap") or {}
+    if not note_map:
+        return "", "", "", ""
+
+    # 取第一（通常也是唯一）条笔记
+    first = next(iter(note_map.values()), {})
+    nd = (first.get("note") or {})
+    title = _clean(nd.get("title") or nd.get("displayTitle") or "")
+    desc = _clean(nd.get("desc") or "")
+    tags = [t.get("name", "") for t in (nd.get("tagList") or []) if t.get("name")]
+    tags_str = " ".join("#" + t for t in tags) if tags else ""
+    images = [img.get("url", "") for img in (nd.get("imageList") or []) if img.get("url")]
+
+    return title, desc, tags_str, images
+
+
 def _get_html(url, timeout=15):
     ua = UA_POOL[random.randint(0, len(UA_POOL) - 1)]
     req = urllib.request.Request(
@@ -171,28 +237,38 @@ def fetch_note(raw_url):
     except Exception as e:  # noqa
         return {"ok": False, "reason": f"抓取失败：{e}"}
 
-    # og:title / <title>
-    title = _meta(html, prop="og:title")
-    if not title:
-        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
-        if m:
-            title = _clean(m.group(1))
+    # ===== 第一优先级：window.__INITIAL_STATE__（小红书 SSR 注入的笔记完整数据） =====
+    title, desc, tags, images = _extract_initial_state(html)
+
     # 去掉站点后缀（如 "真实标题 - 小红书"）
     title = re.sub(r"\s*[-–|]\s*小红书.*$", "", title).strip()
-    xt, xd = _extract_xhs_json(html)
-    # og:title 优先（最可靠：XHS 把笔记标题放进 og:title）；仅当 og:title 缺失或为站点通用标题时，才用页面内嵌 JSON 兜底
-    if (not title or title in GENERIC_TITLES) and xt and xt not in GENERIC_TITLES:
-        title = xt
 
-    desc = _meta(html, prop="og:description")
+    # ===== 第二优先级：og:title / og:description（兜底） =====
+    if not title:
+        title = _meta(html, prop="og:title")
+        if not title:
+            m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+            if m:
+                title = _clean(m.group(1))
+        title = re.sub(r"\s*[-–|]\s*小红书.*$", "", title).strip()
+
+    if not desc:
+        desc = _meta(html, prop="og:description")
     if not desc:
         desc = _meta(html, name="description")
-    # og:description 优先；仅当缺失时用 JSON 提取兜底
-    if not desc and xd:
-        desc = xd
 
-    tags_found = re.findall(r"#([^\s#@]+)", title + " " + desc)
-    tags = " ".join("#" + t for t in dict.fromkeys(tags_found)) if tags_found else ""
+    # ===== 第三优先级：页面内嵌 JSON（最后兜底） =====
+    if not title or title in GENERIC_TITLES:
+        xt, xd = _extract_xhs_json(html)
+        if xt and xt not in GENERIC_TITLES:
+            title = xt
+        if not desc and xd:
+            desc = xd
+
+    # 从标题/正文中补抽标签（如果 __INITIAL_STATE__ 没有标签）
+    if not tags:
+        tags_found = re.findall(r"#([^\s#@]+)", title + " " + desc)
+        tags = " ".join("#" + t for t in dict.fromkeys(tags_found)) if tags_found else ""
 
     if title in GENERIC_TITLES or (not title or len(title) < 2):
         return {
@@ -207,8 +283,10 @@ def fetch_note(raw_url):
                 "请在「正文」框手动粘贴笔记内容后再点拆解。")
     elif status != 200:
         note = f"（页面返回 HTTP {status} 但仍提取到了部分内容）"
+    if images:
+        note = (note + " 含" + str(len(images)) + "张图片") if note else ""
 
-    return {"ok": True, "title": title, "body": desc, "tags": tags, "note": note}
+    return {"ok": True, "title": title, "body": desc, "tags": tags, "note": note, "images": images[:9]}
 
 
 @app.route("/")
