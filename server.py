@@ -53,6 +53,22 @@ def _extract_url(raw):
     return m.group(0).rstrip(".,;。；")
 
 
+def _extract_share_title(raw, url):
+    """从手机分享文本里提取链接前面的标题文字（用户所见即所得，最可靠）。"""
+    if not raw:
+        return ""
+    text = raw
+    if url:
+        idx = text.find(url)
+        if idx > 0:
+            text = text[:idx]
+    text = re.sub(r"(先复制.*|打开【小红书】.*|长按复制.*|点击链接.*|复制打开.*|查看原帖.*|来看这篇好文.*|这篇好文.*)$",
+                  "", text, flags=re.S)
+    text = text.strip(" \t\n\r-—…,.。，：:")
+    text = re.split(r"https?://", text)[0].strip(" \t\n\r-—…,.。，")
+    return text
+
+
 def _meta(html, prop=None, name=None):
     if prop:
         m = re.search(r'<meta[^>]*property=["\']%s["\'][^>]*content=["\'](.*?)["\']'
@@ -239,6 +255,7 @@ def _get_html(url, timeout=15):
 
 def fetch_note(raw_url, debug=False):
     url = _extract_url(raw_url)
+    share_title = _extract_share_title(raw_url, url)
     if not url:
         return {"ok": False, "reason": "未提供有效链接（请把手机复制的链接/分享文本粘贴进来）"}
 
@@ -282,6 +299,10 @@ def fetch_note(raw_url, debug=False):
     # 去掉站点后缀（如 "真实标题 - 小红书"）
     title = re.sub(r"\s*[-–|]\s*小红书.*$", "", title).strip()
 
+    # 商品/带货笔记页面 __INITIAL_STATE__ 不含 noteDetailMap，改用分享文本里用户看到的标题（最可靠）
+    if not title and share_title:
+        title = share_title
+
     # ===== 第二优先级：og:title / og:description（兜底） =====
     if not title:
         title = _meta(html, prop="og:title")
@@ -317,8 +338,14 @@ def fetch_note(raw_url, debug=False):
             "debug": debug_info,
         }
 
-    note = ""
-    if not desc:
+    # 商品/带货笔记：页面异步加载，抓取可能不完整
+    is_goods = ("discovery/item" in final_url) or ("noteAttributes=goods" in final_url)
+    if is_goods and not _get_note_map(html):
+        note = ("⚠️ 该链接为商品/带货笔记，小红书页面为异步加载，自动抓取可能不完整。"
+                "标题已用您分享文本中的原文，正文请核对；若有误请在「正文」框手动补全。")
+    if not note:
+        note = ""
+    if not desc and not note:
         note = ("自动抓取仅取到标题「" + title + "」（正文需登录态）。"
                 "请在「正文」框手动粘贴笔记内容后再点拆解。")
     elif status != 200:
