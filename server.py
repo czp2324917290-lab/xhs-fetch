@@ -127,20 +127,14 @@ def _pick_title(cands):
     return cands[0]
 
 
-def _extract_initial_state(html):
-    """从 window.__INITIAL_STATE__ 提取笔记真实数据（小红书 SSR 注入）。
-    这是最可靠的数据源——标题、正文、标签、图片都在里面，不需要登录态。
-    返回 (title, desc, tags_str, images_list)。"""
-    # 匹配 __INITIAL_STATE__ = {...}  或  window.__INITIAL_STATE__ = {...}
+def _get_note_map(html):
+    """从 window.__INITIAL_STATE__ 解析出 noteDetailMap（noteId -> note 数据）。"""
     m = re.search(r'(?:window\.)?__INITIAL_STATE__\s*=\s*', html)
     if not m:
-        return "", "", "", []
-
-    # 从 = 之后开始找 JSON 对象
+        return {}
     pos = m.end()
-    # 简单的手工 JSON 提取：数大括号层级
     if pos >= len(html) or html[pos] != "{":
-        return "", "", "", []
+        return {}
     depth = 0
     end = pos
     in_str = False
@@ -165,24 +159,50 @@ def _extract_initial_state(html):
             if depth == 0:
                 end = i + 1
                 break
-
     if end <= pos:
-        return "", "", "", ""
-
+        return {}
     raw = html[pos:end]
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
-        return "", "", "", ""
+        return {}
+    return (data.get("note") or {}).get("noteDetailMap") or {}
 
-    # 导航到笔记数据：note.noteDetailMap.{noteId}.note
-    note_map = (data.get("note") or {}).get("noteDetailMap") or {}
+
+def _extract_note_id(url):
+    """从（跟随重定向后的）最终 URL 提取笔记 ID。"""
+    m = re.search(r'(?:/explore/|/discovery/item/|/search_result/|/note/)([0-9a-zA-Z]+)', url) \
+        or re.search(r'noteId=([0-9a-zA-Z]+)', url) \
+        or re.search(r'/([0-9a-zA-Z]{8,})(?:[/?#]|$)', url)
+    return m.group(1) if m else ""
+
+
+def _pick_note(note_map, prefer_id=None):
+    """从 noteDetailMap 选目标笔记：优先 prefer_id 精确匹配，否则选 desc 最长的。"""
     if not note_map:
-        return "", "", "", ""
+        return {}
+    if prefer_id and prefer_id in note_map:
+        return note_map[prefer_id].get("note") or {}
+    best = None
+    best_len = -1
+    for v in note_map.values():
+        nd = v.get("note") or {}
+        dlen = len(nd.get("desc") or "")
+        if dlen > best_len:
+            best_len = dlen
+            best = nd
+    return best or {}
 
-    # 取第一（通常也是唯一）条笔记
-    first = next(iter(note_map.values()), {})
-    nd = (first.get("note") or {})
+
+def _extract_initial_state(html, prefer_id=None):
+    """从 window.__INITIAL_STATE__ 提取笔记真实数据（小红书 SSR 注入）。
+    这是最可靠的数据源——标题、正文、标签、图片都在里面，不需要登录态。
+    返回 (title, desc, tags_str, images_list)。"""
+    # 用新拆分的 _get_note_map / _pick_note 选目标笔记（支持 noteId 精确匹配）
+    note_map = _get_note_map(html)
+    nd = _pick_note(note_map, prefer_id=prefer_id)
+    if not nd:
+        return "", "", "", []
     title = _clean(nd.get("title") or nd.get("displayTitle") or "")
     desc = _clean(nd.get("desc") or "")
     tags = [t.get("name", "") for t in (nd.get("tagList") or []) if t.get("name")]
@@ -214,23 +234,26 @@ def _get_html(url, timeout=15):
         data = resp.read()
         if resp.headers.get("Content-Encoding") == "gzip":
             data = gzip.decompress(data)
-        return data.decode(charset, errors="ignore")
+        return data.decode(charset, errors="ignore"), resp.geturl()
 
 
 def fetch_note(raw_url, debug=False):
     url = _extract_url(raw_url)
     if not url:
-        return {"ok": False, "reason": "未提供有效链接（请把手机复制的链接/分享文本粘贴进来）}
+        return {"ok": False, "reason": "未提供有效链接（请把手机复制的链接/分享文本粘贴进来）"}
 
     status = 200
     debug_info = {}
+    html = ""
+    final_url = url
     try:
-        html = _get_html(url)
+        html, final_url = _get_html(url)
     except urllib.error.HTTPError as e:
         status = e.code
         try:
             charset = e.headers.get_content_charset() or "utf-8"
             html = e.read().decode(charset, errors="ignore")
+            final_url = getattr(e, "url", url)
         except Exception:
             return {"ok": False, "reason": f"页面返回 HTTP {e.code}（小红书需登录态 / 反爬拦截）"}
     except urllib.error.URLError as e:
@@ -239,12 +262,22 @@ def fetch_note(raw_url, debug=False):
         return {"ok": False, "reason": f"抓取失败：{e}"}
 
     # ===== 第一优先级：window.__INITIAL_STATE__（小红书 SSR 注入的笔记完整数据） =====
-    title, desc, tags, images = _extract_initial_state(html)
+    note_id = _extract_note_id(final_url)
+    title, desc, tags, images = _extract_initial_state(html, prefer_id=note_id)
     if debug:
         debug_info["has_initial_state"] = bool(re.search(r'(?:window\.)?__INITIAL_STATE__\s*=', html))
         debug_info["initial_state_hit"] = bool(title or desc)
         debug_info["og_title"] = _meta(html, prop="og:title")
-        debug_info["final_url"] = url
+        debug_info["final_url"] = final_url
+        debug_info["note_id"] = note_id
+        _dbg_map = _get_note_map(html)
+        debug_info["map_keys"] = list(_dbg_map.keys())
+        debug_info["note_previews"] = [
+            {"key": k,
+             "title": (v.get("note") or {}).get("title", "")[:40],
+             "desc": (v.get("note") or {}).get("desc", "")[:40]}
+            for k, v in _dbg_map.items()
+        ]
 
     # 去掉站点后缀（如 "真实标题 - 小红书"）
     title = re.sub(r"\s*[-–|]\s*小红书.*$", "", title).strip()
