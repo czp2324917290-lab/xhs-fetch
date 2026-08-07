@@ -320,6 +320,9 @@ def fetch_note(raw_url, debug=False):
         debug_info["has_initial_state"] = bool(re.search(r'(?:window\.)?__INITIAL_STATE__\s*=', html))
         debug_info["initial_state_hit"] = bool(title or desc)
         debug_info["og_title"] = _meta(html, prop="og:title")
+        debug_info["og_description"] = _meta(html, prop="og:description")
+        debug_info["html_length"] = len(html)
+        debug_info["has_og_desc_tag"] = bool(re.search(r'og:description', html, re.I))
         debug_info["final_url"] = final_url
         debug_info["note_id"] = note_id
         _dbg_map = _get_note_map(html)
@@ -349,6 +352,11 @@ def fetch_note(raw_url, debug=False):
 
     if not desc:
         desc = _meta(html, prop="og:description")
+    if not desc:
+        # 更宽松的兜底：有些页面 meta 属性顺序相反或引号不同
+        m = re.search(r'<meta[^>]+content=[\"\']([^\"\']{20,})[\"\'][^>]*property=[\"\']og:description[\"\']', html, re.I)
+        if m:
+            desc = _clean(m.group(1))
     if not desc:
         desc = _meta(html, name="description")
 
