@@ -351,6 +351,7 @@ def fetch_note(raw_url, debug=False):
         }
 
     # 完整性提示（精确区分商品笔记与普通异步笔记）
+    note = ""
     is_goods = ("discovery/item" in final_url) or ("noteAttributes=goods" in final_url)
     if not note:
         if is_goods:
