@@ -383,14 +383,14 @@ def fetch_note(raw_url, debug=False):
             "debug": debug_info,
         }
 
-    # 完整性提示（精确区分商品笔记与普通异步笔记）
+    # 完整性提示（仅在正文确实为空时提醒）
     note = ""
     is_goods = ("discovery/item" in final_url) or ("noteAttributes=goods" in final_url)
-    if not note:
+    if not desc:
         if is_goods:
-            note = ("⚠️ 该链接为商品/带货笔记，小红书页面异步加载，自动抓取可能不完整。"
-                    "标题已用您分享文本中的原文，正文请核对；若有误请在「正文」框手动补全。")
-        elif not note_map and not desc:
+            note = ("⚠️ 该链接为商品/带货笔记，正文未抓取到。"
+                    "标题已用您分享文本中的原文，请在「正文」框手动粘贴笔记内容后再拆解。")
+        elif not note_map:
             note = "⚠️ 该笔记页面为异步加载，自动抓取可能不完整，正文请核对，有误请手动补全。"
     if not desc and not note:
         note = ("自动抓取仅取到标题「" + title + "」（正文需登录态）。"
