@@ -54,7 +54,9 @@ def _extract_url(raw):
 
 
 def _extract_share_title(raw, url):
-    """从手机分享文本里提取链接前面的标题文字（用户所见即所得，最可靠）。"""
+    """从手机分享文本里提取链接前面的标题文字（用户所见即所得，最可靠）。
+    小红书分享文本格式：「标题正文前缀… http://xhslink.cn/o/xxx 后缀」
+    标题通常 ≤25 字、常以 emoji 结尾；需要从「标题+正文前缀」中只截取标题部分。"""
     if not raw:
         return ""
     text = raw
@@ -62,10 +64,31 @@ def _extract_share_title(raw, url):
         idx = text.find(url)
         if idx > 0:
             text = text[:idx]
+    # 去掉分享后缀
     text = re.sub(r"(先复制.*|打开【小红书】.*|长按复制.*|点击链接.*|复制打开.*|查看原帖.*|来看这篇好文.*|这篇好文.*)$",
                   "", text, flags=re.S)
     text = text.strip(" \t\n\r-—…,.。，：:")
     text = re.split(r"https?://", text)[0].strip(" \t\n\r-—…,.。，")
+
+    # 从「标题+正文前缀」中只提取标题部分：
+    # 小红书标题官方限制 ≤20 字，常以 emoji/！/？ 结尾；后面跟的是正文描述
+    # 策略：≤20 字直接当标题；超长时找最后一个「强结束符(emoji/！/？)」且结果 ≥6 字的位置截断
+    if len(text) <= 20:
+        return text  # 短文本直接当标题
+    # 强结束符：emoji / 全角或半角感叹问号 / 波浪号（标题常用结尾）
+    STRONG_END = re.compile(r'[\U0001F300-\U0001F9FF\U00002600-\U000027BF\u2700-\u27BF\uFE0F\U0001F1E6-\U0001F1FF\u200D]|[！!~～。？?\?]')
+    # 在前 28 字内，从右往左找最后一个强结束符，其右侧应有内容（说明是标题-正文分界）
+    search_area = text[:28]
+    best_cut = -1
+    for m in re.finditer(STRONG_END, search_area):
+        end_pos = m.end()  # 截断点（包含该符号）
+        # 要求：截取后长度 6~22 且该符号后面还有内容（说明切到了分界处）
+        if 6 <= end_pos <= 22 and end_pos < len(search_area):
+            best_cut = end_pos
+    if best_cut > 0:
+        return text[:best_cut].strip()
+    # 兜底：强制截 20 字
+    return text[:20].strip()
     return text
 
 
