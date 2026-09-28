@@ -16,6 +16,7 @@ import re
 import json
 import random
 import gzip
+import zlib
 import urllib.request
 import urllib.error
 
@@ -258,29 +259,62 @@ def _extract_initial_state(html, prefer_id=None):
     return title, desc, tags_str, images
 
 
-def _get_html(url, timeout=15):
+def _build_headers(url, cookie=None):
     ua = UA_POOL[random.randint(0, len(UA_POOL) - 1)]
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Referer": "https://www.xiaohongshu.com/",
-            "Origin": "https://www.xiaohongshu.com",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "cross-site",
-            "Cache-Control": "max-age=0",
-        },
-    )
+    h = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        # 关键：小红书只对「声明了 gzip, deflate 压缩」的请求返回真实笔记页。
+        # urllib 默认不发送 Accept-Encoding，会被判定为爬虫并强制跳转 /login，
+        # 导致只能拿到登录页（正文、标签全空）。实测仅 'gzip, deflate' 这一组合有效，
+        # 单发 'gzip' / 'deflate' / 'identity' 均会被踢到登录页。
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": "https://www.xiaohongshu.com/",
+        "Origin": "https://www.xiaohongshu.com",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site",
+        "Cache-Control": "max-age=0",
+    }
+    if cookie:
+        h["Cookie"] = cookie
+    return h
+
+
+def _get_html(url, timeout=15, cookie=None):
+    req = urllib.request.Request(url, headers=_build_headers(url, cookie))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         charset = resp.headers.get_content_charset() or "utf-8"
         data = resp.read()
-        if resp.headers.get("Content-Encoding") == "gzip":
+        enc = (resp.headers.get("Content-Encoding") or "").lower()
+        if enc == "gzip":
             data = gzip.decompress(data)
+        elif enc == "deflate":
+            try:
+                data = zlib.decompress(data)
+            except zlib.error:
+                # 某些服务端发的 deflate 实际是裸流，需要跳过 2 字节头
+                data = zlib.decompress(data, -zlib.MAX_WBITS)
         return data.decode(charset, errors="ignore"), resp.geturl()
+
+
+# 登录墙：小红书对云端/数据中心 IP 常强制跳转
+# https://www.xiaohongshu.com/login?redirectPath=<原始笔记地址>
+LOGIN_WALL_RE = re.compile(r'xiaohongshu\.com/login|/login\?redirectPath', re.I)
+
+
+def _extract_redirect_path(url):
+    """从登录墙 URL 还原真实笔记地址（含 xsec_token）。"""
+    m = re.search(r'redirectPath=([^&]+)', url or "")
+    if not m:
+        return ""
+    try:
+        from urllib.parse import unquote
+        return unquote(m.group(1))
+    except Exception:
+        return ""
 
 
 def fetch_note(raw_url, debug=False):
@@ -307,6 +341,33 @@ def fetch_note(raw_url, debug=False):
         return {"ok": False, "reason": f"网络无法访问：{e.reason}"}
     except Exception as e:  # noqa
         return {"ok": False, "reason": f"抓取失败：{e}"}
+
+    # ===== 登录墙处理：云端 IP 被强制跳登录页时，页面内没有任何笔记数据 =====
+    # 若不识别，会从登录页的 <title> 提取到「想了解些什么？」这类垃圾标题并误报 ok:true，
+    # 导致前端只拿到标题、正文和标签全空。必须显式识别并如实报错。
+    if LOGIN_WALL_RE.search(final_url or ""):
+        real = _extract_redirect_path(final_url)
+        cookie = (os.environ.get("XHS_COOKIE") or "").strip()
+        if real and cookie:
+            # 已配置 Cookie → 用还原出的真实笔记地址带登录态再试一次
+            try:
+                h2, u2 = _get_html(real, cookie=cookie)
+                if not LOGIN_WALL_RE.search(u2 or ""):
+                    html, final_url = h2, u2
+            except Exception:
+                pass
+        if LOGIN_WALL_RE.search(final_url or ""):
+            reason = "小红书把当前服务器 IP 判定为风险环境，笔记页被强制跳转登录页，无法抓取正文与标签。"
+            reason += (" 已检测到 XHS_COOKIE 但仍被拦截，说明是该出口 IP 被限制。"
+                       if cookie else
+                       " 建议给后端配置 XHS_COOKIE 环境变量后重试；")
+            reason += " 也可换用国内云主机（如腾讯云 CloudBase）。临时方案：手动粘贴标题与文案。"
+            res = {"ok": False, "reason": reason}
+            if debug:
+                res["debug"] = {"final_url": final_url, "redirect_path": real,
+                                "has_cookie": bool(cookie), "html_length": len(html),
+                                "note_id": _extract_note_id(real or "")}
+            return res
 
     # ===== 第一优先级：window.__INITIAL_STATE__（小红书 SSR 注入的笔记完整数据） =====
     note_id = _extract_note_id(final_url)
